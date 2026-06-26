@@ -2,7 +2,7 @@
 
 Move files to and from a vintage **MS-DOS / PC-DOS / FreeDOS** machine over a plain
 **serial cable**, and even **mount its filesystem** on your modern box — driven by a
-tiny (~2 KB) hand-written DOS agent and two Python scripts.
+tiny (~2.5 KB) hand-written DOS agent and two Python scripts.
 
 The DOS side is a single freestanding `XFER.COM` (assembled from `xfercom.asm`, no
 runtime, no linker). The host side is `host.py` (a `scp`/`rsync`-style file-transfer
@@ -44,7 +44,7 @@ noise.
   agent is assembled `cpu 8086` — no 186/286/386 instructions — and uses only
   standard BIOS/DOS calls, so it runs on the oldest IBM PCs and compatibles.
 - A **null-modem serial cable** between the two machines (or an emulator's virtual
-  serial port). The agent uses **COM1** at **9600 8N1**.
+  serial port). The agent uses default **COM1** at **9600 8N1**. (supports COM1-4 and up to 115200 baud rate)
 - **Host:** Python ≥ 3.12. `pyserial` (real serial ports) and `tqdm` (progress
   bars) are installed by default; `fusepy` + libfuse are needed only for the mount
   tool (`pip install ".[mount]"`).
@@ -67,21 +67,113 @@ much of the point: keep it on a "toolkit" diskette and you never have to swap
 floppies or pull a hard drive again to move a few files.
 
 There's an unavoidable chicken-and-egg the first time: you need *a* way to deliver
-the transfer tool before you can use it. Easiest path — get `XFER.COM` onto **one**
-DOS machine first (write a floppy on a modern drive, copy it via an existing link
-like Kermit/INTERLNK, or, in a pinch, type it in with `DEBUG`) — then **serial-copy
-it from there to all your other machines**. Once one machine has it, the rest are a
-`download XFER.COM` away.
+the transfer tool before you can use it. Easiest path - get `XFER.COM` onto a floppy
+in some way first.
 
-On the DOS box, just run it:
+### Bootstrapping via raw serial
 
+Instead of manually typing it in, it can be copied in an emergency with the
+`COPY COM1:` command. I think the copy command still stops on 0x1A even with
+the /B, but not sure and haven't tested. If it is a problem, the procedure is:
+
+`COPY COM1: file /B` on DOS reads bytes from the serial port and writes them to a
+file, stopping when it sees a Ctrl-Z byte (0x1A) — the CP/M-inherited end-of-file
+sentinel. The Linux side sends the file followed by `printf '\x1a'` to trigger that
+stop. Any 0x1A byte inside the binary is indistinguishable from that terminator, so
+`COPY` stops early and the file is silently truncated - retrying will always produce
+the same result.
+
+`XFER.COM` contains two such bytes (a jump displacement at file offset 0x75C and a
+DOS syscall immediate at 0x8C7), so a direct transfer will never produce an intact
+file. The workaround is to substitute those bytes with a harmless placeholder on the
+host, transfer the patched copy, then restore the originals on the DOS side using
+`DEBUG`.
+
+**1. Create a patched copy on the Linux host:**
+
+```bash
+python3 -c "
+d = bytearray(open('XFER.COM', 'rb').read())
+for off in [0x75c, 0x8c7]:   # 0x1A offsets in the current build
+    d[off] = 0xfe             # placeholder — any non-0x1A byte works
+open('XFER_P.COM', 'wb').write(d)
+"
+stty -F /dev/ttyUSB0 9600 raw cs8 -parenb -cstopb -echo
+```
+
+**2. On DOS, configure the port and start receiving:**
+
+```
+C:\> MODE COM1:9600,N,8,1
+C:\> COPY COM1: XFER_P.COM /B
+```
+
+**3. Immediately send from Linux:**
+
+```bash
+{ cat XFER_P.COM; printf '\x1a'; } > /dev/ttyUSB0
+```
+
+**4. Verify the byte count matches** (`ls -l XFER.COM` on the host gives the reference size):
+
+```
+C:\> DIR XFER_P.COM
+```
+
+If the size differs, delete the file and repeat from step 2.
+
+**5. Patch the two bytes back with DEBUG and rename:**
+
+`DEBUG` loads `.COM` files at segment offset 0x100, so each file offset gains 0x100
+when addressed in DEBUG:
+
+```
+C:\> DEBUG XFER_P.COM
+-E 85C 1A
+-E 9C7 1A
+-W
+-Q
+C:\> REN XFER_P.COM XFER.COM
+```
+
+`XFER.COM` is now the real agent. All subsequent transfers via `host.py` use COBS
+framing and full CRC verification - this raw bootstrap is a one-time step.
+
+### Running the agent
+
+No arguments, one argument (baud rate) and two arguments (baud and COM number):
 ```
 C:\> XFER
-xfer ready on COM1 - press Q to quit
+xfer ready on COM1 at 9600 baud - press Q to quit
+
+C:\> XFER 19200
+xfer ready on COM1 at 19200 baud - press Q to quit
+
+C:\> XFER 9600 2
+xfer ready on COM2 at 9600 baud - press Q to quit
 ```
 
-It now listens on COM1. Press **Q** at any time to exit (works even if the host
-goes away mid-transfer).
+The banner always echoes the port and baud in use. Optional arguments let you
+choose a baud rate and/or COM port without recompiling:
+
+| Syntax | Effect |
+|--------|--------|
+| `XFER` | COM1, 9600 baud (defaults) |
+| `XFER baud` | COM1, specified baud |
+| `XFER baud com` | Specified baud and COM port (1–4) |
+
+Supported baud rates are any N where 115200 / N is an integer. Common choices:
+
+| Baud | `host.py` flag | Notes |
+|------|----------------|-------|
+| 9600 | `--baud 9600` | Default; reliable on all hardware including 4.77 MHz 8088. Got approximately 860 bytes / second |
+| 19200 | `--baud 19200` | Works reliably on most machines |
+| 38400 | `--baud 38400` | Comfortable on 286 and faster |
+| 57600 | `--baud 57600` | Approaches the limit of many 8250 UARTs. Didn't observe significant transfer speed increase from floppies or hard drive on the IBM 5155 compared to using 38400. Saturated around 1500 bytes / second. |
+| 115200 | `--baud 115200` | Did not work reliably on the IBM 5155 in testing. Some communication worked, but it got stuck before file transfer started. Maybe it weren't able to keep up? |
+
+Press **Q** at any time to exit cleanly, even mid-transfer. Invalid arguments
+print a usage message and exit.
 
 ## Hardware & cabling
 
@@ -109,16 +201,18 @@ The agent raises DTR/RTS but never waits on CTS/DSR, so the handshake lines can 
 left unconnected (or looped back locally if a stubborn UART/driver insists on
 seeing them).
 
-**Port base.** The agent uses **COM1** at I/O base **0x3F8**, the IBM PC/XT
-standard, so the default just works. If a machine's only serial port is **COM2**
-(0x2F8), change `%define BASE 0x3F8` to `0x2F8` in `xfercom.asm` and rebuild.
+**Port base.** The agent defaults to **COM1** (I/O base 0x3F8), the IBM PC/XT
+standard. Pass a COM port number as the second argument to use COM2–COM4 instead
+(e.g. `XFER 9600 2` for COM2 at 9600 baud). All four standard bases are supported
+(COM1 0x3F8 · COM2 0x2F8 · COM3 0x3E8 · COM4 0x2E8).
 
 **Speed.** 9600 8N1 (~0.8 KB/s effective) is a deliberately safe default: a 4.77 MHz
 8088 polls the UART comfortably at that rate, and the stop-and-wait protocol means
 there's no overrun risk even on the slowest machine. It's slow for big files, but
 these systems mostly move small ones. If a given pair of machines proves rock-solid,
-the 8250 will go faster — raise the divisor in `uart_init` (`xfercom.asm`) and match
-`--baud` on the host (e.g. 19200 or 38400). 9600 will never let you down.
+pass a higher baud rate as the first argument (e.g. `XFER 38400`) and match with
+`--baud` on the host. See the baud rate table above for tested values. 9600 will
+never let you down.
 
 ## File-transfer tool — `host.py`
 
@@ -227,8 +321,7 @@ so the binary stream isn't corrupted by line-state bytes.)
 - The protocol carries **no timestamps**, so mounted files get synthesized times.
 - The mount assumes it is the **only writer** while mounted (true for a
   single-tasking DOS box).
-- Targets **COM1 / 9600 8N1**; change the divisor/base in `xfercom.asm` for other
-  rates or ports.
+- COM port (1–4) and baud rate are command-line arguments; no recompile needed.
 
 ## License
 

@@ -6,10 +6,16 @@
 ; Builds a flat 16-bit COM (org 0x100) that needs no runtime/link step:
 ;   nasm -f bin xfercom.asm -o XFER.COM
 ;
+; Usage: XFER [baud [com]]
+;   baud — any integer N such that 115200/N is an integer, range 2..115200
+;           (e.g. 300, 1200, 9600, 19200, 38400, 57600, 115200); default 9600
+;   com  — COM port number 1..4; default 1
+; If one argument is given it is the baud rate; COM1 is assumed.
 ; It reproduces the behaviour of xfer.c (the pyc-compiled agent): the same
 ; COBS framing, per-packet CRC-16/CCITT, whole-file CRC-32 (zlib 0xEDB88320),
 ; ACK pacing, and the OPEN/DATA/CLOSE/GET/MKDIR/LIST/QUIT command set, talking
-; to host.py over COM1 (0x3F8, 8N1, 9600).  The DOS/UART primitives that xfer.c
+; to host.py over a configurable COM port at a configurable baud rate (default
+; COM1, 9600 baud, 8N1).  The DOS/UART primitives that xfer.c
 ; pulled from stdlib (uart_*, POSIX file I/O, find_first/next, mkdir, puts) are
 ; inlined here as INT 14h/21h and direct UART port I/O.
 ;
@@ -22,7 +28,8 @@ cpu 8086        ; 8086/8088-clean (no 186/286/386 instructions) — runs on a
 bits 16
 org 0x100
 
-%define BASE     0x3F8
+; COM port base addresses are stored at runtime in v_base (set by parse_args).
+; Default: COM1 = 0x3F8.  Table: com_tbl dw 0x3F8,0x2F8,0x3E8,0x2E8.
 %define CHUNK     128
 
 %define T_OPEN    1
@@ -52,12 +59,24 @@ org 0x100
 ; Entry / main loop  (mirrors main() in xfer.c:215)
 ; ---------------------------------------------------------------------------
 start:
+    call parse_args              ; sets v_base, v_div, v_com, v_baudstr
     call uart_init
     mov word [v_fd], -1
     mov word [v_wcrc], 0
     mov word [v_wcrc+2], 0
-    mov si, msg_ready
-    call puts
+    ; Banner: "xfer ready on COMn at NNNN baud - press Q to quit"
+    mov si, msg_rdyA             ; "xfer ready on COM"
+    call putstr
+    mov ah, 0x02
+    mov dl, '0'
+    add dl, [v_com]
+    int 0x21
+    mov si, msg_rdyB             ; " at "
+    call putstr
+    mov si, [v_baudstr]          ; asciiz baud digits
+    call putstr
+    mov si, msg_rdyC             ; " baud - press Q to quit"
+    call puts                    ; adds CRLF
 
 .main_loop:
     call read_frame             ; AX = n (decoded packet length in pk[])
@@ -858,32 +877,215 @@ serve_list:
 ; Inlined runtime primitives (UART port I/O + DOS INT 21h)
 ; ---------------------------------------------------------------------------
 
-; uart_init() — 8N1, 9600 (divisor 12), FIFOs on, IRQs off (serial.asm:32).
+; ---------------------------------------------------------------------------
+; parse_args — read PSP command tail, populate v_base/v_div/v_com/v_baudstr.
+;
+; Syntax: XFER [baud [com]]
+;   If 0 args: defaults (9600, COM1).
+;   If 1 arg:  baud rate; COM1.
+;   If 2 args: baud rate, then COM number.
+;   Bad input: print usage and exit.
+;
+; Clobbers: AX, BX, CX, DX, SI, DI (called only from start: before any state).
+; ---------------------------------------------------------------------------
+parse_args:
+    ; --- install defaults ---
+    mov word [v_base], 0x3F8
+    mov word [v_div],  12        ; 115200 / 12 = 9600
+    mov byte [v_com],  1
+    mov word [v_baudstr], msg_9600
+
+    ; --- scan PSP command tail (org 0x100: DS = PSP segment) ---
+    mov si, 0x81                 ; tail starts here; [0x80] = length byte
+
+.pa_skip1:                       ; skip leading spaces / tabs
+    mov al, [si]
+    cmp al, 0x0D
+    je .pa_done                  ; CR → no args
+    cmp al, ' '
+    je .pa_skip1x
+    cmp al, 0x09
+    je .pa_skip1x
+    jmp .pa_baud_start
+.pa_skip1x:
+    inc si
+    jmp .pa_skip1
+
+.pa_baud_start:
+    ; First non-space must be a digit.
+    mov al, [si]
+    cmp al, '0'
+    jb .pa_err
+    cmp al, '9'
+    ja .pa_err
+
+    ; Init 32-bit baud accumulator and copy-buffer pointer.
+    mov word [v_baud32],   0
+    mov word [v_baud32+2], 0
+    mov di, v_baudstr_buf        ; copy digits here for the banner
+
+.pa_baud_digit:
+    mov al, [si]
+    cmp al, '0'
+    jb .pa_baud_end
+    cmp al, '9'
+    ja .pa_baud_end
+    ; Store in banner buffer.
+    mov [di], al
+    inc di
+    ; acc = acc * 10 (32-bit: low_word then high_word, carrying).
+    mov ax, [v_baud32]
+    mov cx, 10
+    mul cx                       ; DX:AX = low * 10
+    mov bx, dx                   ; bx = carry into high word
+    mov [v_baud32], ax
+    mov ax, [v_baud32+2]
+    mul cx                       ; DX:AX = high * 10 (DX==0 for our range)
+    add ax, bx
+    mov [v_baud32+2], ax
+    ; acc += digit
+    mov al, [si]
+    sub al, '0'
+    xor ah, ah
+    add [v_baud32], ax
+    adc word [v_baud32+2], 0
+    inc si
+    jmp .pa_baud_digit
+
+.pa_baud_end:
+    mov byte [di], 0             ; NUL-terminate banner buffer
+    mov word [v_baudstr], v_baudstr_buf
+
+    ; --- validate baud: 2 <= baud <= 115200 ---
+    mov ax, [v_baud32+2]         ; high word
+    test ax, ax
+    jnz .pa_baud_hi
+
+    ; high == 0: check low >= 2
+    mov ax, [v_baud32]           ; low word
+    cmp ax, 2
+    jb .pa_err
+    ; divisor = 115200 / baud  (115200 = 0x1C200)
+    mov dx, 1
+    mov ax, 0xC200               ; DX:AX = 115200
+    div word [v_baud32]          ; AX = divisor (fits: 115200/2 = 57600 <= 65535)
+    mov [v_div], ax
+    jmp .pa_baud_ok
+
+.pa_baud_hi:
+    ; high != 0: only accept exactly 115200 (high=1, low=0xC200)
+    cmp ax, 1
+    jne .pa_err
+    mov ax, [v_baud32]
+    cmp ax, 0xC200
+    jne .pa_err
+    mov word [v_div], 1          ; divisor = 1 → 115200 baud
+
+.pa_baud_ok:
+    ; --- look for COM arg: skip spaces after baud ---
+.pa_skip2:
+    mov al, [si]
+    cmp al, 0x0D
+    je .pa_done                  ; CR → done, use defaults for COM
+    cmp al, ' '
+    je .pa_skip2x
+    cmp al, 0x09
+    je .pa_skip2x
+    jmp .pa_com_start
+.pa_skip2x:
+    inc si
+    jmp .pa_skip2
+
+.pa_com_start:
+    ; Must be a single digit 1..4 followed immediately by end/space.
+    mov al, [si]
+    cmp al, '0'
+    jb .pa_err
+    cmp al, '9'
+    ja .pa_err
+    sub al, '0'
+    mov [v_com], al
+    inc si
+    ; Next char must be end-of-line, space, or tab (no multi-digit COM).
+    mov al, [si]
+    cmp al, 0x0D
+    je .pa_com_ok
+    cmp al, ' '
+    je .pa_trail
+    cmp al, 0x09
+    je .pa_trail
+    jmp .pa_err                  ; digit or garbage after COM number
+
+.pa_trail:                       ; skip trailing spaces; any non-space is an error
+    inc si
+.pa_trail_lp:
+    mov al, [si]
+    cmp al, 0x0D
+    je .pa_com_ok
+    cmp al, ' '
+    je .pa_trail_lp_x
+    cmp al, 0x09
+    je .pa_trail_lp_x
+    jmp .pa_err                  ; trailing garbage
+.pa_trail_lp_x:
+    inc si
+    jmp .pa_trail_lp
+
+.pa_com_ok:
+    ; Validate COM number 1..4.
+    mov al, [v_com]
+    cmp al, 1
+    jb .pa_err
+    cmp al, 4
+    ja .pa_err
+    ; Map to base address: index = (com - 1) * 2, look up in com_tbl.
+    dec al
+    xor ah, ah
+    shl ax, 1                    ; *2 (word index); shl r16,1 is 8086-legal
+    mov bx, com_tbl
+    add bx, ax
+    mov ax, [bx]
+    mov [v_base], ax
+
+.pa_done:
+    ret
+
+.pa_err:
+    mov si, msg_usage
+    call puts
+    mov ax, 0x4C01
+    int 0x21                     ; exit(1)
+
+; ---------------------------------------------------------------------------
+; uart_init() — 8N1, runtime baud (v_div) and port (v_base), FIFOs on, IRQs off.
 uart_init:
     push ax
+    push bx
     push dx
-    mov dx, BASE+1
+    mov bx, [v_base]
+    lea dx, [bx+1]
     xor al, al
-    out dx, al                  ; IER = 0
-    mov dx, BASE+3
+    out dx, al                  ; IER = 0  (interrupts off)
+    lea dx, [bx+3]
     mov al, 0x80
-    out dx, al                  ; LCR: DLAB = 1
-    mov dx, BASE
-    mov al, 12
-    out dx, al                  ; DLL = 12
-    mov dx, BASE+1
-    xor al, al
-    out dx, al                  ; DLM = 0
-    mov dx, BASE+3
+    out dx, al                  ; LCR: set DLAB to access divisor latches
+    mov dx, bx
+    mov ax, [v_div]             ; AL = DLL (low byte), AH = DLM (high byte)
+    out dx, al                  ; DLL
+    lea dx, [bx+1]
+    mov al, ah
+    out dx, al                  ; DLM
+    lea dx, [bx+3]
     mov al, 0x03
-    out dx, al                  ; LCR: 8N1, DLAB = 0
-    mov dx, BASE+2
+    out dx, al                  ; LCR: 8N1, clear DLAB
+    lea dx, [bx+2]
     mov al, 0xC7
     out dx, al                  ; FCR: enable + clear FIFOs
-    mov dx, BASE+4
+    lea dx, [bx+4]
     mov al, 0x0B
     out dx, al                  ; MCR: DTR, RTS, OUT2
     pop dx
+    pop bx
     pop ax
     ret
 
@@ -892,6 +1094,8 @@ uart_init:
 ; is the universal escape from any wedged state (serial.asm:83).
 uart_getc:
     push dx
+    push bx
+    mov bx, [v_base]
 .wait:
     mov ah, 0x01                ; INT 16h: peek keystroke (ZF=1 -> none)
     int 0x16
@@ -903,32 +1107,36 @@ uart_getc:
     cmp al, 'Q'
     je do_quit                  ; 'Q' -> clean exit, no stack unwind needed
 .nokey:
-    mov dx, BASE+5
+    lea dx, [bx+5]
     in al, dx                   ; LSR
     test al, 1                  ; data ready?
     jz .wait
-    mov dx, BASE
+    mov dx, bx
     in al, dx                   ; RBR
     xor ah, ah
+    pop bx
     pop dx
     ret
 
 ; uart_putc(AL=byte) — blocks until THR empty, then sends (serial.asm:102).
 uart_putc:
     push ax
+    push cx
     push dx
     push bx
-    mov bl, al
+    mov cl, al                  ; save byte in CL (BX needed for port base)
+    mov bx, [v_base]
 .wait:
-    mov dx, BASE+5
+    lea dx, [bx+5]
     in al, dx                   ; LSR
     test al, 0x20               ; THR empty?
     jz .wait
-    mov dx, BASE
-    mov al, bl
+    mov dx, bx
+    mov al, cl
     out dx, al
     pop bx
     pop dx
+    pop cx
     pop ax
     ret
 
@@ -1068,6 +1276,25 @@ do_rename:
     mov ax, -1
     ret
 
+; putstr(SI=asciiz) — write string to the DOS console, no CRLF.
+putstr:
+    push ax
+    push dx
+    push si
+.pstr_loop:
+    mov dl, [si]
+    test dl, dl
+    jz .pstr_done
+    mov ah, 0x02
+    int 0x21
+    inc si
+    jmp .pstr_loop
+.pstr_done:
+    pop si
+    pop dx
+    pop ax
+    ret
+
 ; puts(SI=asciiz) — write the string + CRLF to the DOS console (cosmetic log).
 puts:
     push ax
@@ -1094,10 +1321,18 @@ puts:
     ret
 
 ; ---------------------------------------------------------------------------
-; Console messages — only the startup banner survives; per-operation text is now
-; pushed by the host as T_MSG packets (keeps the COM small/simple).
+; Console messages and lookup tables (part of the image — emit bytes).
 ; ---------------------------------------------------------------------------
-msg_ready    db "xfer ready on COM1 - press Q to quit", 0
+; Banner fragments (start: concatenates these at runtime).
+msg_rdyA  db "xfer ready on COM", 0
+msg_rdyB  db " at ", 0
+msg_rdyC  db " baud - press Q to quit", 0
+; Default baud string used when no argument is given.
+msg_9600  db "9600", 0
+; Usage / error message.
+msg_usage db "usage: XFER [baud [com]]  baud 2..115200, com 1..4", 0
+; COM port base-address table (indexed by (com-1)*2).
+com_tbl   dw 0x3F8, 0x2F8, 0x3E8, 0x2E8
 
 ; ---------------------------------------------------------------------------
 ; Uninitialised data / buffers.  Declared as `equ` offsets just past the code so
@@ -1126,3 +1361,11 @@ op        equ tx + 600          ; 600
 fbuf      equ op + 600          ; CHUNK (128)
 eb        equ fbuf + CHUNK      ; 32
 dta       equ eb + 32           ; 128
+
+; parse_args runtime state (populated before uart_init; no emitted bytes).
+v_base      equ dta + 128       ; word  — runtime UART base port address
+v_div       equ v_base + 2      ; word  — UART baud divisor (115200 / baud)
+v_com       equ v_div + 2       ; byte  — COM port number 1..4 (for banner)
+v_baud32    equ v_com + 1       ; dword — scratch: 32-bit baud accumulator
+v_baudstr   equ v_baud32 + 4   ; word  — near ptr to asciiz baud string
+v_baudstr_buf equ v_baudstr + 2 ; 8 bytes — buffer for user-supplied baud digits
