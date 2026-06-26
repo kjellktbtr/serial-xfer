@@ -1,0 +1,60 @@
+[project]
+name = "serial-xfer"
+version = "0.1.0"
+description = "Host to vintage-DOS serial file transfer + FUSE mount, with a tiny hand-written DOS .COM agent"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Kjell Kristian Grane Torgersen" }]
+keywords = ["dos", "serial", "vintage", "retrocomputing", "fuse", "file-transfer"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Filesystems",
+    "Topic :: Communications :: File Sharing",
+]
+dependencies = ["pyserial", "tqdm"]   # real serial ports + host progress bars
+
+[project.optional-dependencies]
+mount = ["fusepy"]                    # mountfs.py (needs libfuse on the host)
+dev = ["unicorn", "ruff"]             # test_com.py runs the COM under Unicorn
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # formatter conflicts
+    "COM812", "ISC001",
+    # this is a small CLI/asm tool, not a library
+    "T201",        # print() is the CLI's output
+    "INP001",      # flat scripts, no package __init__
+    "PLC0415",     # deliberate lazy imports (fuse/serial/socket)
+    # exception-message strictness (we keep short f-string messages)
+    "EM101", "EM102", "TRY003",
+    # boolean flags / positional bools are fine here (progress=, recursive=, ...)
+    "FBT001", "FBT002", "FBT003",
+    # protocol code has named byte constants + a few inline ones
+    "PLR2004",
+    # don't force a docstring on every small helper, or rewrite docstring layout
+    "D100", "D101", "D102", "D103", "D104", "D105", "D107",
+    "D203", "D205", "D209", "D213", "D301", "D401",
+    # a few functions are inherently branchy (dispatch loops, run_queue)
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+    # callback/override args that are part of a fixed signature
+    "ARG002", "ARG005", "ANN401",
+    # immediate-use lambdas that capture a loop var (used in the same iteration)
+    "B023", "PLW0108",
+    # not a pytest suite
+    "PT018",
+    # asserts are used in the codec self-test and the Unicorn suite
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_com.py" = [
+    "S404", "S603", "S607", "S306", "S311", "SLF001", "ARG001",
+    "ANN001", "ANN201", "ANN202", "ANN204",
+]
