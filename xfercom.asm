@@ -47,11 +47,14 @@ org 0x100
 %define T_PREAD   13                ; v2: ranged read  (offset4 len2 name)
 %define T_PWRITE  14                ; v2: ranged write (offset4 name\0 bytes)
 %define T_RAW     15                ; v2: print DATA verbatim (no added CRLF)
+%define T_VERSION 16                ; v3: query protocol version; ACK replies with version byte
 %define T_ACK     0x10
 %define T_NAK     0x11
 
 %define FA_DIREC  0x10
 %define DTA_ATTR  21
+%define DTA_TIME  22                ; word: packed time (bits 15-11 h, 10-5 min, 4-0 s/2)
+%define DTA_DATE  24                ; word: packed date (bits 15-9 year-1980, 8-5 m, 4-0 d)
 %define DTA_SIZE  26
 %define DTA_NAME  30
 
@@ -145,6 +148,8 @@ start:
     je .h_raw
     cmp al, T_QUIT
     je .h_quit_ack
+    cmp al, T_VERSION
+    je .h_version
     ; default: ACK
     mov bl, T_ACK
     mov bh, [v_seq]
@@ -220,9 +225,29 @@ start:
     jne .hc_setstatus
     mov byte [v_status], 0
 .hc_setstatus:
+    ; Extract time/date if present (dlen >= 8 = v1 extended CLOSE from host)
+    mov word [v_ftime], 0
+    mov word [v_ftime+2], 0
+    cmp word [v_dlen], 8
+    jl .hc_notime
+    mov ax, [pk+6]             ; time LE (DATA byte 4-5)
+    mov [v_ftime], ax
+    mov ax, [pk+8]             ; date LE (DATA byte 6-7)
+    mov [v_ftime+2], ax
+.hc_notime:
     cmp word [v_fd], 0
     jl .hc_nofd
     mov bx, [v_fd]
+    ; set date/time on open handle before closing (only if non-zero)
+    mov cx, [v_ftime]
+    mov dx, [v_ftime+2]
+    test cx, cx
+    jnz .hc_setft
+    test dx, dx
+    jz .hc_doclose
+.hc_setft:
+    call do_setftime            ; BX=handle, CX=packed time, DX=packed date
+.hc_doclose:
     call do_close
     mov word [v_fd], -1
 .hc_nofd:
@@ -304,6 +329,18 @@ start:
     mov bh, [v_seq]
     mov si, pk
     xor cx, cx
+    call send_packet
+    jmp .main_loop
+
+; --- VERSION (T_VERSION=16): reply ACK with 1-byte protocol version (0x01).
+; An old agent without this handler falls through to the default empty-ACK above,
+; which the host interprets as protocol version 0 (no date/time support). ---
+.h_version:
+    mov byte [eb], 1            ; protocol version 1
+    mov bl, T_ACK
+    mov bh, [v_seq]
+    mov si, eb
+    mov cx, 1
     call send_packet
     jmp .main_loop
 
@@ -802,14 +839,23 @@ serve_get:
     jmp .loop
 .eof:
     mov bx, [v_rfd]
+    call do_getftime            ; CX=packed time, DX=packed date (must be before close)
+    mov [v_ftime], cx
+    mov [v_ftime+2], dx
     call do_close
     mov ax, [v_rcrc]
     mov dx, [v_rcrc+2]
-    call crc_to_be
+    call crc_to_be              ; fills eb+0..3 with CRC-32 big-endian
+    mov ax, [v_ftime]
+    mov [eb+4], al
+    mov [eb+5], ah              ; time LE at eb+4..5
+    mov ax, [v_ftime+2]
+    mov [eb+6], al
+    mov [eb+7], ah              ; date LE at eb+6..7
     mov bl, T_CLOSE
     mov bh, [v_dseq]
     mov si, eb
-    mov cx, 4
+    mov cx, 8                   ; crc32(4) + time(2) + date(2)
     call send_packet
     call wait_ack
     ret
@@ -841,8 +887,16 @@ serve_list:
     mov [eb+3], al
     mov al, [dta+DTA_SIZE+3]
     mov [eb+4], al
+    mov al, [dta+DTA_TIME]      ; packed time LE (2 bytes at DTA+22)
+    mov [eb+5], al
+    mov al, [dta+DTA_TIME+1]
+    mov [eb+6], al
+    mov al, [dta+DTA_DATE]      ; packed date LE (2 bytes at DTA+24)
+    mov [eb+7], al
+    mov al, [dta+DTA_DATE+1]
+    mov [eb+8], al
     mov si, dta+DTA_NAME
-    mov di, eb+5
+    mov di, eb+9
     xor cx, cx
 .name:
     cmp cx, 14
@@ -856,7 +910,7 @@ serve_list:
     inc cx
     jmp .name
 .namedone:
-    add cx, 5                   ; alen = 5 + i
+    add cx, 9                   ; alen = 9 + i (attr + size + time + date + name)
     mov bl, T_ENTRY
     mov bh, 0
     mov si, eb
@@ -1239,6 +1293,18 @@ do_lseek:
     int 0x21
     ret
 
+; do_getftime(BX=handle) -> CX=packed time, DX=packed date (INT 21h AH=57h AL=0).
+do_getftime:
+    mov ax, 0x5700
+    int 0x21
+    ret
+
+; do_setftime(BX=handle, CX=packed time, DX=packed date) (INT 21h AH=57h AL=1).
+do_setftime:
+    mov ax, 0x5701
+    int 0x21
+    ret
+
 ; do_delete(DX=path) -> AX=0/-1 (INT 21h AH=41h).
 do_delete:
     mov ah, 0x41
@@ -1353,8 +1419,9 @@ v_rfd     equ v_name + 2        ; word
 v_rcrc    equ v_rfd + 2         ; dword
 v_dseq    equ v_rcrc + 4        ; byte
 v_got     equ v_dseq + 1        ; word
+v_ftime   equ v_got + 2         ; dword: packed time(w) + packed date(w) for get/set
 
-rxf       equ v_got + 2         ; 600
+rxf       equ v_ftime + 4       ; 600
 pk        equ rxf + 600         ; 600
 tx        equ pk + 600          ; 600
 op        equ tx + 600          ; 600

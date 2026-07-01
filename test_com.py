@@ -172,6 +172,8 @@ def test_framing():
                 n += 1
                 # send_packet
                 uc = _fresh()
+                # parse_args sets v_base at runtime; direct calls need it pre-set
+                uc.mem_write(SYM["v_base"], (0x3F8).to_bytes(2, "little"))
                 tx = bytearray()
                 uc.hook_add(
                     UC_HOOK_INSN, lambda u, p, sz, ud: 0x20, None, 1, 0, UC_X86_INS_IN
@@ -198,6 +200,7 @@ def test_framing():
                 frame = host.make_frame(t, s, d)
                 rxq = list(frame)
                 uc = _fresh()
+                uc.mem_write(SYM["v_base"], (0x3F8).to_bytes(2, "little"))
                 uc.hook_add(
                     UC_HOOK_INSN,
                     lambda u, p, sz, ud: (
@@ -244,6 +247,7 @@ class _FakeDos:
         self.console = bytearray()
         self.exited = None
         self.keys = deque()  # pending BIOS keystrokes (ASCII codes)
+        self.ftimes: dict[str, tuple[int, int]] = {}  # name -> (fat_time, fat_date)
 
     def _cf(self, s):
         f = self.uc.reg_read(UC_X86_REG_EFLAGS)
@@ -376,6 +380,21 @@ class _FakeDos:
                 self._cf(False)
         elif ah == 0x39:
             self._cf(False)
+        elif ah == 0x57:  # get/set file date and time
+            h = self.handles.get(bx)
+            if h is None:
+                uc.reg_write(UC_X86_REG_AX, 6)
+                self._cf(True)
+                return
+            name = h[0]
+            if al == 0:  # get
+                ft = self.ftimes.get(name, (0, 0))
+                uc.reg_write(UC_X86_REG_CX, ft[0])  # packed time
+                uc.reg_write(UC_X86_REG_DX, ft[1])  # packed date
+                self._cf(False)
+            elif al == 1:  # set
+                self.ftimes[name] = (cx, dx)
+                self._cf(False)
         elif ah == 0x1A:
             self.dta = dx
         elif ah == 0x4E:
@@ -411,7 +430,10 @@ class _FakeDos:
             self._cf(True)
             return
         name, size, attr = self.finds.pop(0)
+        ft = self.ftimes.get(name, (0, 0))
         uc.mem_write(self.dta + 21, bytes([attr]))
+        uc.mem_write(self.dta + 22, ft[0].to_bytes(2, "little"))  # packed time
+        uc.mem_write(self.dta + 24, ft[1].to_bytes(2, "little"))  # packed date
         uc.mem_write(self.dta + 26, size.to_bytes(4, "little"))
         uc.mem_write(self.dta + 30, name.encode("latin1") + b"\x00")
         uc.reg_write(UC_X86_REG_AX, 0)
@@ -453,6 +475,11 @@ def _boot(seed=None, keys=None):
     in-memory DOS; return (dos, link, thread) once the banner has printed."""
     uc = _fresh()
     uc.reg_write(UC_X86_REG_SP, 0xFFFE)
+    # Set up a minimal PSP command tail so parse_args sees "no arguments" and uses
+    # defaults (9600 baud, COM1).  DOS convention: byte at 0x80 = tail length,
+    # then the tail ends with CR (0x0D).  Unicorn zeroes memory, but 0x00 ≠ CR,
+    # so parse_args would mis-parse it as a bad argument without this setup.
+    uc.mem_write(0x80, bytes([0, 0x0D]))
     to_dos, from_dos = _Chan(), _Chan()
     dlab = [False]
 
@@ -483,6 +510,7 @@ def _boot(seed=None, keys=None):
     while b"COM1" not in bytes(dos.console) and time.time() < deadline:
         time.sleep(0.02)
     link = host.Link(_Transport(to_dos, from_dos), retries=10, timeout=8.0)
+    link.query_version()  # detect v1 date/time support; sets link.proto_version
     return dos, link, th
 
 
@@ -502,7 +530,10 @@ def test_e2e():
 
     assert n == len(payload) and m == len(payload)
     assert dst.read_bytes() == payload, "round-trip payload mismatch"
-    assert ("TEST.BIN", 0x20, len(payload)) in entries, f"bad listing {entries}"
+    # entries are (name, attr, size, mtime) 4-tuples in protocol v1
+    assert any(e[:3] == ("TEST.BIN", 0x20, len(payload)) for e in entries), (
+        f"bad listing {entries}"
+    )
     con = dos.console.decode("latin1")
     assert "press Q to quit" in con, "startup banner/quit hint missing"
     assert "hello-target" in con, "T_MSG text was not displayed on target"
@@ -697,8 +728,138 @@ def test_progress():
     print("  prog:    summary + CR-overwriting 80-col progress line on target")
 
 
+def test_version_and_timestamps():
+    """T_VERSION handshake and file date/time round-trip via ENTRY + GET/CLOSE."""
+    # 2024-03-15 14:30:00 in FAT packed format
+    fat_date = (44 << 9) | (3 << 5) | 15  # year 1980+44=2024, month 3, day 15
+    fat_time = (14 << 11) | (30 << 5) | 0  # 14:30:00 (seconds/2 = 0)
+    expected_epoch = host.fat_to_epoch(fat_date, fat_time)
+    assert expected_epoch is not None
+
+    dos, link, th = _boot(seed={"DATED.TXT": b"hello timestamps"})
+    # _boot already called query_version(); assert it returned 1
+    assert link.proto_version == 1, f"expected proto_version 1, got {link.proto_version}"
+    dos.ftimes["DATED.TXT"] = (fat_time, fat_date)
+
+    # list_dir should include time/date in ENTRY
+    entries = link.list_dir("*.*")
+    match = [e for e in entries if e[0] == "DATED.TXT"]
+    assert match, f"DATED.TXT not in entries: {entries}"
+    name, attr, size, mtime = match[0]
+    assert mtime is not None, "mtime should be populated in v1 ENTRY"
+    assert abs(mtime - expected_epoch) < 2, f"ENTRY mtime {mtime} != expected {expected_epoch}"
+
+    # download: agent sends date in CLOSE; host should apply it to the local file
+    dst = Path(tempfile.mktemp())
+    link.download_file_once("DATED.TXT", dst)
+    got_mtime = dst.stat().st_mtime
+    assert abs(got_mtime - expected_epoch) < 2, (
+        f"download mtime {got_mtime} != expected {expected_epoch}"
+    )
+
+    # upload: host sends date in CLOSE; agent should call do_setftime
+    src = Path(tempfile.mktemp())
+    src.write_bytes(b"upload with timestamp")
+    import os as _os
+    _os.utime(src, (expected_epoch, expected_epoch))
+    link.upload_file_once(src, "UPPED.TXT")
+    assert "UPPED.TXT" in dos.ftimes, "agent did not call do_setftime on upload"
+    got_ft, got_fd = dos.ftimes["UPPED.TXT"]
+    assert (got_fd, got_ft) == (fat_date, fat_time), (
+        f"upload date/time mismatch: got ({got_fd:#x}, {got_ft:#x}), "
+        f"expected ({fat_date:#x}, {fat_time:#x})"
+    )
+
+    link.quit()
+    th.join(timeout=5.0)
+    assert dos.exited == 0
+    print(
+        f"  timestamps: version=1, ENTRY date/time OK, download mtime applied, "
+        f"upload setftime OK"
+    )
+
+
+def test_link_status_observer():
+    """LinkStatus state-machine, byte-rate, and the Link observer hook."""
+    import mountgui
+
+    # --- state machine via observer callback ---
+    s = mountgui.LinkStatus()
+    assert s.state == "idle"
+
+    s("ack")
+    assert s.state == "ok"
+
+    s("nak", "test NAK")
+    assert s.state == "nak" and s.message == "test NAK"
+
+    s("timeout")
+    assert s.state == "no_reply"
+
+    s("fail", "gave up")
+    assert s.state == "error" and s.message == "gave up"
+
+    s.set_ok("back")
+    assert s.state == "ok" and s.message == "back"
+
+    s.set_error("broke")
+    assert s.state == "error"
+
+    # --- byte-rate via add_bytes / speed_bps ---
+    s.reset()
+    assert s.state == "idle"
+    s.add_bytes(1000)
+    time.sleep(0.06)
+    s.add_bytes(1000)
+    assert s.speed_bps() > 0, "expected positive speed after two add_bytes calls"
+
+    state, _msg, spd = s.snapshot()
+    assert state == "idle"  # add_bytes does not change state
+    assert spd > 0
+
+    # --- Link observer integration: NAK then ACK ---
+    events: list[str] = []
+
+    def _obs(event: str, message: str = "") -> None:
+        events.append(event)
+
+    class _MockTransport:
+        def __init__(self, responses: list[bytes]) -> None:
+            self._resp = iter(responses)
+
+        def send(self, data: bytes) -> None:
+            pass
+
+        def read_until(self, term: bytes, timeout: float = 5.0) -> bytes:
+            try:
+                return next(self._resp)
+            except StopIteration:
+                return b""  # simulates timeout
+
+    nak_frame = host.make_frame(host.T_NAK, 0)
+    ack_frame = host.make_frame(host.T_ACK, 0)
+    link = host.Link(_MockTransport([nak_frame, ack_frame]), observer=_obs)
+    result = link.xact(host.T_DATA)
+    assert result == b""
+    assert "nak" in events and "ack" in events
+    assert events[-1] == "ack"
+
+    # --- Link observer integration: all timeouts → fail ---
+    events.clear()
+    link2 = host.Link(_MockTransport([b"", b""]), retries=2, observer=_obs)
+    try:
+        link2.xact(host.T_DATA)
+        raise AssertionError("should have raised OSError")
+    except OSError:
+        pass
+    assert events.count("timeout") == 2
+    assert "fail" in events
+
+    print("  gui_obs: LinkStatus state-machine, speed, Link observer (NAK/ACK/timeout/fail) OK")
+
+
 def test_size():
-    assert len(COM) < 2200, f"COM unexpectedly large: {len(COM)} bytes"
+    assert len(COM) < 2800, f"COM unexpectedly large: {len(COM)} bytes"
     trailing_zeros = len(COM) - len(COM.rstrip(b"\x00"))
     assert trailing_zeros <= 1, (
         f"COM has {trailing_zeros} trailing zero bytes (BSS not stripped)"
@@ -717,6 +878,8 @@ def main():
     test_v2()
     test_mountfs()
     test_progress()
+    test_version_and_timestamps()
+    test_link_status_observer()
     test_size()
     print("ALL TESTS PASS")
 

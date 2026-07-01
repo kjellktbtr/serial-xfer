@@ -18,6 +18,8 @@ Wire format (see PROTOCOL.md / xfercom.asm):
 from __future__ import annotations
 
 import contextlib
+import datetime
+import os
 import socket
 import sys
 import time
@@ -46,6 +48,7 @@ T_OPEN, T_DATA, T_CLOSE, T_QUIT, T_GET = 1, 2, 3, 4, 5
 T_MKDIR, T_LIST, T_ENTRY, T_MSG = 6, 7, 8, 9
 T_DEL, T_RMD, T_REN, T_PREAD, T_PWRITE = 10, 11, 12, 13, 14  # protocol v2
 T_RAW = 15  # print DATA verbatim on the target (host owns the line endings)
+T_VERSION = 16  # query agent protocol version; ACK payload = version byte (0=legacy)
 T_ACK, T_NAK = 0x10, 0x11
 
 CHUNK = 128  # file bytes per DATA packet (also the v2 pread/pwrite span)
@@ -109,6 +112,37 @@ def crc32_be(crc: int) -> bytes:
     return bytes(
         [(crc >> 24) & 0xFF, (crc >> 16) & 0xFF, (crc >> 8) & 0xFF, crc & 0xFF]
     )
+
+
+def epoch_to_fat(mtime: float) -> tuple[int, int]:
+    """Convert a POSIX epoch timestamp to (fat_date, fat_time) 16-bit LE words.
+    DOS stores local time in FAT format.  Returns (0, 0) on any conversion error."""
+    try:
+        dt = datetime.datetime.fromtimestamp(mtime)
+        year = max(0, dt.year - 1980)
+        fat_date = (year << 9) | (dt.month << 5) | dt.day
+        fat_time = (dt.hour << 11) | (dt.minute << 5) | (dt.second // 2)
+        return fat_date & 0xFFFF, fat_time & 0xFFFF
+    except (OSError, OverflowError, ValueError):
+        return 0, 0
+
+
+def fat_to_epoch(fat_date: int, fat_time: int) -> float | None:
+    """Convert FAT (fat_date, fat_time) words to a POSIX epoch float, or None
+    when the date/time is zero (unset) or otherwise invalid."""
+    if fat_date == 0 and fat_time == 0:
+        return None
+    year = 1980 + (fat_date >> 9)
+    month = max(1, (fat_date >> 5) & 0x0F)
+    day = max(1, fat_date & 0x1F)
+    hours = min(23, fat_time >> 11)
+    minutes = min(59, (fat_time >> 5) & 0x3F)
+    seconds = min(58, (fat_time & 0x1F) * 2)
+    try:
+        dt = datetime.datetime(year, month, day, hours, minutes, seconds)
+        return dt.timestamp()
+    except (ValueError, OSError, OverflowError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +269,14 @@ class _Job:
     """One file to move; carries its retry state so it can be requeued."""
 
     def __init__(
-        self, kind: str, local: Path, dos_path: str, size: int | None = None
+        self, kind: str, local: Path, dos_path: str, size: int | None = None,
+        mtime: float | None = None
     ) -> None:
         self.kind = kind  # "up" or "down"
         self.local = Path(local)
         self.dos_path = dos_path
         self.size = size  # bytes, if known up front (for the summary/estimate)
+        self.mtime = mtime  # POSIX epoch from directory listing, if known
         self.attempts = 0
         self.last_error: str | None = None
 
@@ -312,12 +348,26 @@ class TransferReport:
 # ---------------------------------------------------------------------------
 class Link:
     def __init__(
-        self, transport: Transport, retries: int = 5, timeout: float = 3.0
+        self, transport: Transport, retries: int = 5, timeout: float = 3.0,
+        observer: Callable[[str, str], None] | None = None,
     ) -> None:
         self.t = transport
         self.retries = retries
         self.timeout = timeout
         self.seq = 0
+        self.proto_version = 0  # set by query_version()
+        self.observer = observer  # optional(event, message) callback; see mountgui.LinkStatus
+
+    def query_version(self) -> int:
+        """Ask the agent its protocol version.  An old agent without T_VERSION
+        support returns an empty ACK, which maps to version 0 (no date/time).
+        Sets and returns self.proto_version."""
+        try:
+            rdata = self.xact(T_VERSION)
+            self.proto_version = rdata[0] if rdata else 0
+        except OSError:
+            self.proto_version = 0
+        return self.proto_version
 
     def _read_frame(self) -> bytes | None:
         raw = self.t.read_until(b"\x00", timeout=self.timeout)
@@ -333,15 +383,26 @@ class Link:
             self.t.send(frame)
             resp = self._read_frame()
             if resp is None:
+                if self.observer:
+                    self.observer("timeout", "")
                 continue
             parsed = parse_packet(resp)
             if parsed is None:
+                if self.observer:
+                    self.observer("timeout", "")
                 continue
             rtype, rseq, rdata = parsed
             if rtype == T_ACK and rseq == seq:
                 self.seq += 1
+                if self.observer:
+                    self.observer("ack", "")
                 return rdata
+            if rtype == T_NAK and rseq == seq:
+                if self.observer:
+                    self.observer("nak", "")
             # NAK or stale ack -> resend
+        if self.observer:
+            self.observer("fail", f"no ACK for packet type {ptype} seq {seq}")
         raise OSError(f"no ACK for packet type {ptype} seq {seq}")
 
     def mkdir(self, dos_path: str) -> None:
@@ -430,7 +491,15 @@ class Link:
             self.xact(T_DATA, chunk)
             if on_chunk:
                 on_chunk(len(chunk))
-        status = self.xact(T_CLOSE, crc32_be(crc32(data)))
+        close_payload = crc32_be(crc32(data))
+        if self.proto_version >= 1:
+            # Append the local file's mtime as FAT date/time (v1 extended CLOSE)
+            fat_date, fat_time = epoch_to_fat(Path(local).stat().st_mtime)
+            close_payload += bytes(
+                [fat_time & 0xFF, (fat_time >> 8) & 0xFF,
+                 fat_date & 0xFF, (fat_date >> 8) & 0xFF]
+            )
+        status = self.xact(T_CLOSE, close_payload)
         if not status or status[0] != 0:
             raise OSError(f"whole-file CRC mismatch on {dos_path}")
         return len(data)
@@ -446,6 +515,7 @@ class Link:
         self.xact(T_GET, remote_path.encode("ascii"))
         out = bytearray()
         expected = None
+        dl_mtime: float | None = None
         while True:
             resp = self._read_frame()
             parsed = parse_packet(resp) if resp else None
@@ -460,18 +530,27 @@ class Link:
             elif rtype == T_CLOSE:
                 if len(rdata) >= 4:
                     expected = int.from_bytes(rdata[:4], "big")
+                if self.proto_version >= 1 and len(rdata) >= 8:
+                    # v1 extended CLOSE: time(2 LE) + date(2 LE) after crc32
+                    fat_time = int.from_bytes(rdata[4:6], "little")
+                    fat_date = int.from_bytes(rdata[6:8], "little")
+                    dl_mtime = fat_to_epoch(fat_date, fat_time)
                 self.t.send(make_frame(T_ACK, rseq))
                 break
         if expected is not None and crc32(bytes(out)) != expected:
             raise OSError(f"whole-file CRC mismatch on {remote_path}")
         Path(local).parent.mkdir(parents=True, exist_ok=True)
         Path(local).write_bytes(bytes(out))
+        if dl_mtime is not None:
+            os.utime(local, (dl_mtime, dl_mtime))
         return len(out)
 
-    def list_dir(self, spec: str) -> list[tuple[str, int, int]]:
-        """Enumerate a DOS directory; returns [(name, attr, size), ...]."""
+    def list_dir(self, spec: str) -> list[tuple[str, int, int, float | None]]:
+        """Enumerate a DOS directory; returns [(name, attr, size, mtime), ...].
+        mtime is a POSIX epoch float (None when the agent does not send dates,
+        or when the date is zero/invalid)."""
         self.xact(T_LIST, spec.encode("ascii"))
-        out: list[tuple[str, int, int]] = []
+        out: list[tuple[str, int, int, float | None]] = []
         while True:
             resp = self._read_frame()
             parsed = parse_packet(resp) if resp else None
@@ -482,8 +561,17 @@ class Link:
                 self.t.send(make_frame(T_ACK, rseq))
                 attr = rdata[0] if rdata else 0
                 size = int.from_bytes(rdata[1:5], "little") if len(rdata) >= 5 else 0
-                name = rdata[5:].split(b"\x00")[0].decode("ascii", "replace")
-                out.append((name, attr, size))
+                if self.proto_version >= 1 and len(rdata) >= 9:
+                    # v1 layout: attr(1) size(4) time(2 LE) date(2 LE) name
+                    fat_time = int.from_bytes(rdata[5:7], "little")
+                    fat_date = int.from_bytes(rdata[7:9], "little")
+                    mtime = fat_to_epoch(fat_date, fat_time)
+                    name = rdata[9:].split(b"\x00")[0].decode("ascii", "replace")
+                else:
+                    # v0 layout: attr(1) size(4) name
+                    mtime = None
+                    name = rdata[5:].split(b"\x00")[0].decode("ascii", "replace")
+                out.append((name, attr, size, mtime))
             elif rtype == T_CLOSE:
                 self.t.send(make_frame(T_ACK, rseq))
                 break
@@ -515,7 +603,7 @@ class Link:
         print(f"\n Directory of {dir_path or '.'}\n")
         nfiles = nbytes = 0
         subdirs: list[str] = []
-        for name, attr, size in self.list_dir(spec):
+        for name, attr, size, _mtime in self.list_dir(spec):
             if name in (".", ".."):
                 continue
             if attr & 0x10:
@@ -695,14 +783,14 @@ class Link:
 
     def _walk_remote(self, remote_dir: str, local_dir: Path, jobs: list[_Job]) -> None:
         spec = (remote_dir + "\\*.*") if remote_dir else "*.*"
-        for name, attr, size in self.list_dir(spec):
+        for name, attr, size, mtime in self.list_dir(spec):
             if name in (".", ".."):
                 continue
             rpath = (remote_dir + "\\" + name) if remote_dir else name
             if attr & 0x10:  # subdirectory
                 self._walk_remote(rpath, local_dir / name, jobs)
             else:
-                jobs.append(_Job("down", local_dir / name, rpath, size))
+                jobs.append(_Job("down", local_dir / name, rpath, size, mtime))
 
     def download_tree(
         self, remote_dir: str, local_dir: Path, report: TransferReport | None = None

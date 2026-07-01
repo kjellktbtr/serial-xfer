@@ -38,13 +38,17 @@ import host  # noqa: E402
 
 
 class Node:
-    __slots__ = ("attr", "children", "is_dir", "listed", "name", "size")
+    __slots__ = ("attr", "children", "is_dir", "listed", "mtime", "name", "size")
 
-    def __init__(self, name: str, is_dir: bool, size: int = 0, attr: int = 0) -> None:
+    def __init__(
+        self, name: str, is_dir: bool, size: int = 0, attr: int = 0,
+        mtime: float | None = None
+    ) -> None:
         self.name = name
         self.is_dir = is_dir
         self.size = size
         self.attr = attr
+        self.mtime = mtime  # POSIX epoch from DOS directory entry, or None
         self.children: dict[str, Node] | None = {} if is_dir else None
         self.listed = False  # dirs: has the child list been fetched yet?
 
@@ -107,10 +111,10 @@ class RemoteFS:
         with self.clock:
             if node.listed:
                 return
-            for name, attr, size in entries:
+            for name, attr, size, mtime in entries:
                 if name in (".", ".."):
                     continue
-                child = Node(name, bool(attr & 0x10), size, attr)
+                child = Node(name, bool(attr & 0x10), size, attr, mtime)
                 node.children[name] = child
                 if child.is_dir:
                     self._queue.append((child, self._join(dp, name)))
@@ -235,21 +239,26 @@ class RemoteFS:
 def _build_fuse_ops(rfs: RemoteFS) -> Operations:
     import os
 
-    from fuse import FuseOSError, Operations
+    try:
+        from fuse import FuseOSError, Operations
+    except ImportError:  # pragma: no cover – Windows with WinFsp
+        from winfsp.fuse import FuseOSError, Operations  # type: ignore[no-redef]
 
     now = time.time()
-    uid, gid = os.getuid(), os.getgid()
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    gid = os.getgid() if hasattr(os, "getgid") else 0
 
     class DosFuse(Operations):
         def _attr(self, node: Node) -> dict[str, int | float]:
             mode = (0o040000 | 0o755) if node.is_dir else (0o100000 | 0o644)
+            t = node.mtime if node.mtime is not None else now
             return {
                 "st_mode": mode,
                 "st_nlink": 2 if node.is_dir else 1,
                 "st_size": node.size,
-                "st_ctime": now,
-                "st_mtime": now,
-                "st_atime": now,
+                "st_ctime": t,
+                "st_mtime": t,
+                "st_atime": t,
                 "st_uid": uid,
                 "st_gid": gid,
             }
@@ -331,6 +340,10 @@ def _make_transport(
 
 
 def main(argv: list[str]) -> int:
+    if not argv:
+        import mountgui
+        mountgui.build_and_run()
+        return 0
     ap = argparse.ArgumentParser(description="mount a remote DOS FS over serial")
     ap.add_argument("--port", help="real serial device, e.g. /dev/ttyUSB0")
     ap.add_argument("--socket", help="emulator serial as a Unix socket")
@@ -341,14 +354,19 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     link = host.Link(_make_transport(args))
+    link.query_version()  # detect v1 date/time support before any listing
     rfs = RemoteFS(link, args.root)
     print(f"crawling {args.root} ...", flush=True)
     rfs.start()
 
-    from fuse import FUSE
+    try:
+        from fuse import FUSE
+    except ImportError:  # pragma: no cover – Windows with WinFsp
+        from winfsp.fuse import FUSE  # type: ignore[no-redef]
 
-    # Runs in the foreground until unmounted (fusermount -u <mountpoint>), which
-    # tells the agent to quit via the destroy() callback.
+    # Runs in the foreground until unmounted (fusermount -u <mountpoint> on Linux,
+    # or the WinFsp tray unmount on Windows), which tells the agent to quit via
+    # the destroy() callback.
     FUSE(_build_fuse_ops(rfs), args.mountpoint, foreground=True, nothreads=False)
     return 0
 

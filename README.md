@@ -282,6 +282,24 @@ File contents are read on demand (ranged reads) and written through (ranged
 writes). This is safe to cache because a DOS box is single-tasking and **only this
 program** mutates it while mounted, so the in-memory tree stays authoritative.
 
+## Mounting on Windows (WinFsp)
+
+`mountfs.py` tries to import `fuse` (the [fusepy](https://github.com/fusepy/fusepy) package) first; if that fails it falls back to WinFsp's fusepy-compatible layer (`winfsp.fuse`). The cache and I/O core (`RemoteFS`) is FUSE-free and portable.
+
+**Windows prerequisites:**
+1. Install [WinFsp](https://winfsp.dev/) (the kernel-mode FUSE provider for Windows).
+2. `pip install ".[mount]"` (installs `winfsp`; requires the WinFsp SDK in PATH).
+
+Then mount as usual, pointing at a drive letter:
+```
+python mountfs.py --port COM3 Z:\ --root "C:\\"
+```
+
+Unmount with the WinFsp tray icon or `net use Z: /delete`. Note that POSIX
+permission/ownership fields (`st_uid`, `st_gid`, `st_mode`) are set to safe
+defaults and are cosmetic under WinFsp. **Windows mounting needs testing on a real
+Windows machine** — it has not been exercised in CI.
+
 ## Building the agent
 
 A prebuilt `XFER.COM` is included. To rebuild after editing `xfercom.asm`:
@@ -318,10 +336,11 @@ so the binary stream isn't corrupted by line-state bytes.)
 
 - DOS filenames are **8.3** (≤12 chars), upper-case; the host mangles longer host
   names to unique 8.3 names.
-- The protocol carries **no timestamps**, so mounted files get synthesized times.
 - The mount assumes it is the **only writer** while mounted (true for a
   single-tasking DOS box).
 - COM port (1–4) and baud rate are command-line arguments; no recompile needed.
+- `mountfs.py` does not set the DOS timestamp on files written through the mount
+  (a future improvement; needs a set-by-name packet).
 
 ## License
 

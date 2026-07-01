@@ -1,0 +1,8 @@
+ - [x] Transmit date in addition to file name and size to preserve it when copying old (and new) files.
+ - [x] Support to mount in Windows too. Maybe WinFsp can be used?
+ - [x] GUI for mountfs.py: Tkinter control panel (port/baud/root/mountpoint, status, speed) launched when `python mountfs.py` has no args.
+ - [ ] Verify Windows/WinFsp mount on a real Windows machine (untested in CI).
+ - [ ] Windows: Unmount button in the GUI is a no-op (use WinFsp tray); investigate a programmatic unmount API.
+ - [ ] Set DOS date/time on files written through the mount (needs a set-by-name packet; `utimens` is currently a no-op for mount-written files).
+ - [ ] The `test_size` limit in `test_com.py` was raised to 2800; document and enforce the intent that XFER.COM stays well below 3 KB.
+ - [ ] `docs/wiki/msdos-bios-modules.md`, `msdos-commands.md`, `msdos-data-structures.md`, `msdos-device-drivers.md`, `msdos-fat16-format.md`, `msdos-kernel-modules.md`, and `msdos-v4-architecture.md` (from a prior project incarnation) are not listed in `docs/wiki/index.md` and are orphaned; `msdos-bios-modules.md` and `msdos-data-structures.md` also contain dangling `[[sources/bios-and-boot]]`/`sources/msdos-int21.md` links. Reconcile or remove — out of scope for the docs/raw/1/ ingest (2026-07-01).
